@@ -54,7 +54,6 @@ def is_cat_present(waveform):
     max_rank = 5
     results = infer(waveform)
     for result in results[0:max_rank]:
-        print(result)
         if result[1] > 0.1 and result[0] in relevant_classes:
             return True
     return False
