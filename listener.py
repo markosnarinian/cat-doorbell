@@ -33,7 +33,6 @@ Requirements
 import io
 import queue
 import threading
-import time
 from collections import deque
 
 import numpy as np

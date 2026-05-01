@@ -9,11 +9,11 @@ import sys
 from pathlib import Path
 
 import requests
-from dotenv import dotenv_values
 
-config = dotenv_values()
+IP_ADDRESS = "192.168.1.10"
+PORT = 9000
 
-ENDPOINT = f"http://{config['IP_ADDRESS']}:9000/waveform"
+ENDPOINT = f"http://{IP_ADDRESS}:{PORT}/waveform"
 WAV_FILE = Path(__file__).parent / "miaow_16k.wav"
 
 
