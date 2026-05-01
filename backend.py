@@ -1,7 +1,5 @@
 import csv
 import os
-from random import sample
-from this import s
 
 import kagglehub
 import numpy as np
