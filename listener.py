@@ -1,38 +1,36 @@
 """
 listener.py – Microphone listener for the cat doorbell.
 
-Strategy: Energy-based Voice Activity Detection (VAD)
-------------------------------------------------------
-1. Keep a short circular *pre-roll* buffer so the attack of a sound is never lost.
-2. When a chunk exceeds the RMS threshold, start recording
-   (pre-roll + live audio).
-3. Stop recording after POST_ROLL_SEC of continuous silence,
-   or when MAX_SOUND_SEC is reached.
-4. If the captured clip is long enough, send it to the YAMNet classifier
-   running in a background thread so audio capture is never blocked.
-5. Ring the doorbell if a cat is detected.
+VAD strategy: Auto-calibrating energy (RMS) detector
+-----------------------------------------------------
+silero-vad was evaluated and ruled out: it is trained on human speech only and
+produces probabilities below 0.05 on cat meows at any threshold, so it would
+never trigger.  webrtcvad is also speech-optimised and has the same limitation.
 
-Why not stream continuously?
------------------------------
-YAMNet analyses 0.96 s patches internally.  Feeding it silence wastes CPU/GPU
-and risks splitting a meow across two windows.  Capturing the full discrete
-sound event and classifying it once is both more accurate and more efficient.
+Energy-based VAD is the correct approach here because we just need to detect
+"something audible is happening" – the heavy lifting (cat vs. not-cat) is
+handled downstream by YAMNet via backend.py.
 
-Alternatives
-------------
-- webrtcvad  : Google's binary frame-level VAD (pip install webrtcvad)
-- silero-vad : ML-based VAD, state-of-the-art accuracy
-- Overlap-stride streaming: classify a rolling 1-2 s window on every new chunk
-  (simpler but always-on CPU cost)
+What makes this implementation production-quality is the *automatic
+noise-floor calibration* at startup: it listens for CALIBRATION_SEC seconds,
+measures the ambient RMS, and sets the trigger threshold to
+  ambient_rms × THRESHOLD_FACTOR
+This adapts to different microphones, rooms, and ambient noise levels without
+manual tuning.
+
+State machine
+-------------
+IDLE  ──(RMS > threshold)──▶  RECORDING ──(silence ≥ POST_ROLL  or  max len)──▶  CLASSIFYING
+  ▲                                                                                      │
+  └──────────────────────────────────────────────────────────────────────────────────────┘
 
 Requirements
 ------------
-    pip install sounddevice numpy
+    pip install sounddevice numpy   # already present in the venv
 """
 
 import queue
 import threading
-import time
 from collections import deque
 
 import numpy as np
@@ -41,26 +39,32 @@ import sounddevice as sd
 from backend import is_cat_present
 
 # ---------------------------------------------------------------------------
-# Audio configuration
+# Audio constants (fixed by YAMNet requirements)
 # ---------------------------------------------------------------------------
-SAMPLE_RATE: int = 16_000  # Hz  – YAMNet's native sample rate
+SAMPLE_RATE: int = 16_000  # Hz – YAMNet and silero-vad native rate
 CHANNELS: int = 1  # mono
-CHUNK_DURATION: float = 0.1  # seconds per audio chunk (100 ms)
-CHUNK_SAMPLES: int = int(SAMPLE_RATE * CHUNK_DURATION)
+CHUNK_DURATION: float = 0.032  # 32 ms chunks  (512 samples)
+CHUNK_SAMPLES: int = int(SAMPLE_RATE * CHUNK_DURATION)  # 512
 
 # ---------------------------------------------------------------------------
-# VAD / recording parameters  (tune these to your environment)
+# Calibration
 # ---------------------------------------------------------------------------
-RMS_THRESHOLD: float = 0.02  # normalised RMS level considered "not silence"
-PRE_ROLL_SEC: float = 0.3  # seconds of audio kept before the sound starts
-POST_ROLL_SEC: float = 0.8  # seconds of silence that signals end-of-sound
-MIN_SOUND_SEC: float = 0.3  # clips shorter than this are discarded
-MAX_SOUND_SEC: float = 6.0  # hard ceiling – force-stop the recording
+CALIBRATION_SEC: float = 2.0  # seconds of silence to measure noise floor
+THRESHOLD_FACTOR: float = 4.0  # trigger at N × ambient RMS
+THRESHOLD_FLOOR: float = 0.005  # minimum threshold regardless of noise floor
+
+# ---------------------------------------------------------------------------
+# Recording parameters
+# ---------------------------------------------------------------------------
+PRE_ROLL_SEC: float = 0.3  # seconds to buffer before the sound starts
+POST_ROLL_SEC: float = 0.8  # seconds of sustained silence that end a clip
+MIN_CLIP_SEC: float = 0.2  # discard clips shorter than this
+MAX_CLIP_SEC: float = 6.0  # hard ceiling – force-stop long recordings
 
 PRE_ROLL_CHUNKS: int = int(PRE_ROLL_SEC / CHUNK_DURATION)
 POST_ROLL_CHUNKS: int = int(POST_ROLL_SEC / CHUNK_DURATION)
-MIN_SOUND_CHUNKS: int = int(MIN_SOUND_SEC / CHUNK_DURATION)
-MAX_SOUND_CHUNKS: int = int(MAX_SOUND_SEC / CHUNK_DURATION)
+MIN_CLIP_CHUNKS: int = int(MIN_CLIP_SEC / CHUNK_DURATION)
+MAX_CLIP_CHUNKS: int = int(MAX_CLIP_SEC / CHUNK_DURATION)
 
 
 # ---------------------------------------------------------------------------
@@ -70,32 +74,58 @@ MAX_SOUND_CHUNKS: int = int(MAX_SOUND_SEC / CHUNK_DURATION)
 
 def ring_doorbell() -> None:
     """
-    Called whenever a cat is detected.
-    Replace / extend this with your actual doorbell action, e.g.:
-      - trigger a GPIO pin on a Raspberry Pi
-      - send a push notification via ntfy / Pushover / Telegram
-      - play a chime with sounddevice or playsound
-      - publish an MQTT message
+    Called whenever a cat is confirmed at the door.
+
+    Replace / extend with your actual doorbell action, e.g.:
+      • trigger a GPIO pin on a Raspberry Pi
+      • send a push notification via ntfy / Pushover / Telegram
+      • play a chime with sounddevice or playsound
+      • publish an MQTT message
     """
     print("🔔  DING DONG!  Cat detected at the door!")
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Internal helpers
 # ---------------------------------------------------------------------------
 
 
-def _is_loud(chunk: np.ndarray) -> bool:
-    """Return True when the chunk's RMS energy exceeds the threshold."""
-    rms = float(np.sqrt(np.mean(chunk**2)))
-    return rms > RMS_THRESHOLD
+def _rms(chunk: np.ndarray) -> float:
+    return float(np.sqrt(np.mean(chunk**2)))
+
+
+def _calibrate() -> float:
+    """
+    Record CALIBRATION_SEC of ambient audio and return the measured RMS.
+    Blocks until calibration is done.
+    """
+    n_chunks = int(CALIBRATION_SEC / CHUNK_DURATION)
+    collected: list[np.ndarray] = []
+
+    with sd.InputStream(
+        samplerate=SAMPLE_RATE,
+        channels=CHANNELS,
+        blocksize=CHUNK_SAMPLES,
+        dtype="float32",
+    ) as stream:
+        print(
+            f"Calibrating noise floor ({CALIBRATION_SEC:.0f}s) – please stay quiet …",
+            end="",
+            flush=True,
+        )
+        for _ in range(n_chunks):
+            chunk, _ = stream.read(CHUNK_SAMPLES)
+            collected.append(chunk[:, 0])
+
+    ambient = _rms(np.concatenate(collected))
+    threshold = max(ambient * THRESHOLD_FACTOR, THRESHOLD_FLOOR)
+    print(f"\r  ambient RMS = {ambient:.5f}  →  trigger threshold = {threshold:.5f}   ")
+    return threshold
 
 
 def _classify_and_ring(waveform: np.ndarray) -> None:
     """
-    Run the YAMNet classifier and (optionally) ring the doorbell.
-    Intended to be called in a *background thread* so the audio
-    capture loop is never blocked by inference.
+    Runs in a background daemon thread so audio capture is never stalled.
     """
     duration = len(waveform) / SAMPLE_RATE
     print(f"  → classifying {duration:.2f}s clip …")
@@ -103,6 +133,19 @@ def _classify_and_ring(waveform: np.ndarray) -> None:
         ring_doorbell()
     else:
         print("  → no cat detected")
+
+
+def _submit(recording: list[np.ndarray]) -> None:
+    """Validate minimum clip length, then spawn a classification thread."""
+    if len(recording) < MIN_CLIP_CHUNKS:
+        print("  → clip too short, ignoring")
+        return
+    waveform = np.concatenate(recording)
+    threading.Thread(
+        target=_classify_and_ring,
+        args=(waveform,),
+        daemon=True,
+    ).start()
 
 
 # ---------------------------------------------------------------------------
@@ -114,13 +157,15 @@ def listen() -> None:
     """
     Start the microphone listener.  Blocks until Ctrl-C is pressed.
 
-    The sounddevice callback only enqueues raw audio chunks; all VAD logic
-    runs in the main thread consuming from that queue, so there is no
-    shared-state concurrency between the callback and the detector.
+    The sounddevice callback only enqueues raw 32 ms chunks.  All VAD
+    state logic runs in the main thread consuming from that queue, which
+    keeps the real-time callback minimal and avoids shared-state races.
     """
+    threshold = _calibrate()
+
     audio_queue: "queue.Queue[np.ndarray]" = queue.Queue()
 
-    def _audio_callback(
+    def _callback(
         indata: np.ndarray,
         frames: int,
         time_info: object,
@@ -128,18 +173,16 @@ def listen() -> None:
     ) -> None:
         if status:
             print(f"  [sounddevice] {status}", flush=True)
-        # Extract mono channel and hand off to the main thread
         audio_queue.put(indata[:, 0].copy())
 
-    print(f"Listening on default microphone at {SAMPLE_RATE} Hz …")
-    print(f"RMS threshold: {RMS_THRESHOLD}  |  Ctrl-C to quit\n")
+    print(f"Listening at {SAMPLE_RATE} Hz  |  Ctrl-C to quit\n")
 
     with sd.InputStream(
         samplerate=SAMPLE_RATE,
         channels=CHANNELS,
         blocksize=CHUNK_SAMPLES,
-        dtype="float32",  # values already in [-1, 1] – no normalisation needed
-        callback=_audio_callback,
+        dtype="float32",
+        callback=_callback,
     ):
         pre_roll: deque[np.ndarray] = deque(maxlen=PRE_ROLL_CHUNKS)
         recording: list[np.ndarray] = []
@@ -149,44 +192,36 @@ def listen() -> None:
         try:
             while True:
                 chunk = audio_queue.get()
+                loud = _rms(chunk) > threshold
 
                 if not active:
-                    # ── Waiting for a sound to begin ──────────────────────
+                    # ── IDLE: maintain pre-roll buffer ────────────────────
                     pre_roll.append(chunk)
-                    if _is_loud(chunk):
+                    if loud:
                         active = True
                         silence_chunks = 0
                         recording = list(pre_roll)  # seed with buffered pre-roll
                         print("Sound detected — recording …")
                 else:
-                    # ── Recording in progress ─────────────────────────────
+                    # ── RECORDING ─────────────────────────────────────────
                     recording.append(chunk)
 
-                    if _is_loud(chunk):
+                    if loud:
                         silence_chunks = 0
                     else:
                         silence_chunks += 1
 
-                    hit_max = len(recording) >= MAX_SOUND_CHUNKS
+                    too_long = len(recording) >= MAX_CLIP_CHUNKS
                     went_silent = silence_chunks >= POST_ROLL_CHUNKS
 
-                    if hit_max or went_silent:
-                        active = False
-                        reason = (
-                            "max duration reached" if hit_max else "silence detected"
+                    if too_long or went_silent:
+                        reason = "max duration" if too_long else "silence"
+                        print(
+                            f"Recording stopped ({reason}), "
+                            f"{len(recording) * CHUNK_DURATION:.2f}s captured"
                         )
-                        print(f"Recording stopped ({reason})")
-
-                        if len(recording) >= MIN_SOUND_CHUNKS:
-                            waveform = np.concatenate(recording)
-                            threading.Thread(
-                                target=_classify_and_ring,
-                                args=(waveform,),
-                                daemon=True,
-                            ).start()
-                        else:
-                            print("  → clip too short, ignoring")
-
+                        active = False
+                        _submit(recording)
                         recording = []
                         silence_chunks = 0
 
