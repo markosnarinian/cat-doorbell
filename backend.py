@@ -1,10 +1,15 @@
 import csv
+import io
 import os
 
 import kagglehub
 import numpy as np
+import requests
 import scipy
 import tensorflow as tf
+from dotenv import dotenv_values
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import JSONResponse
 from scipy.io import wavfile
 
 # Download latest version of the model (uses cache if already downloaded)
@@ -57,6 +62,57 @@ def is_cat_present(waveform):
         if result[1] > 0.1 and result[0] in relevant_classes:
             return True
     return False
+
+
+config = dotenv_values(".env")
+
+app = FastAPI()
+
+
+def ring_doorbell():
+    requests.post(
+        f"http://{config['IP_ADDRESS']}/rpc",
+        json={"id": 1, "method": "Switch.Set", "params": {"id": 0, "on": True}},
+    )
+
+
+@app.post("/waveform")
+async def classify(file: UploadFile = File(...)) -> JSONResponse:
+    """
+    Accept a WAV file upload, run the YAMNet cat classifier,
+    and ring the doorbell if a cat meow is detected.
+
+    Returns JSON with keys:
+      - cat_detected (bool)
+      - top_results  (list of [class_name, score] pairs)
+    """
+    if not file.filename or not file.filename.lower().endswith(".wav"):
+        raise HTTPException(status_code=400, detail="Only .wav files are supported")
+
+    contents = await file.read()
+    try:
+        sample_rate, wav_data = wavfile.read(io.BytesIO(contents))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=422, detail=f"Could not parse WAV file: {exc}"
+        ) from exc
+
+    sample_rate, wav_data = ensure_sample_rate(sample_rate, wav_data)
+    waveform = wav_data / tf.int16.max
+
+    cat_detected = is_cat_present(waveform)
+
+    if cat_detected:
+        print("classify: cat detected – ringing doorbell")
+        ring_doorbell()
+    else:
+        print("classify: no cat detected")
+
+    return JSONResponse(
+        {
+            "cat_detected": cat_detected,
+        }
+    )
 
 
 if __name__ == "__main__":

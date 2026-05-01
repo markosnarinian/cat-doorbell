@@ -30,15 +30,22 @@ Requirements
     pip install sounddevice numpy
 """
 
+import io
 import queue
 import threading
 import time
 from collections import deque
 
 import numpy as np
+import requests
+import scipy.io.wavfile as wav
 import sounddevice as sd
 
-from backend import is_cat_present
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+IP_ADDRESS = "192.168.1.10"
+PORT = 9000
 
 # ---------------------------------------------------------------------------
 # Audio configuration
@@ -64,23 +71,6 @@ MAX_SOUND_CHUNKS: int = int(MAX_SOUND_SEC / CHUNK_DURATION)
 
 
 # ---------------------------------------------------------------------------
-# Doorbell
-# ---------------------------------------------------------------------------
-
-
-def ring_doorbell() -> None:
-    """
-    Called whenever a cat is detected.
-    Replace / extend this with your actual doorbell action, e.g.:
-      - trigger a GPIO pin on a Raspberry Pi
-      - send a push notification via ntfy / Pushover / Telegram
-      - play a chime with sounddevice or playsound
-      - publish an MQTT message
-    """
-    print("🔔  DING DONG!  Cat detected at the door!")
-
-
-# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -91,18 +81,24 @@ def _is_loud(chunk: np.ndarray) -> bool:
     return rms > RMS_THRESHOLD
 
 
-def _classify_and_ring(waveform: np.ndarray) -> None:
+def _post_waveform(waveform: np.ndarray) -> dict:
     """
-    Run the YAMNet classifier and (optionally) ring the doorbell.
-    Intended to be called in a *background thread* so the audio
-    capture loop is never blocked by inference.
+    Encode *waveform* (float32, [-1, 1]) as a 16-bit PCM WAV and POST it to
+    the YAMNet classifier endpoint.  Returns the parsed JSON response.
     """
-    duration = len(waveform) / SAMPLE_RATE
-    print(f"  → classifying {duration:.2f}s clip …")
-    if is_cat_present(waveform):
-        ring_doorbell()
-    else:
-        print("  → no cat detected")
+    # Convert float32 → int16 so the backend can divide by int16.max correctly
+    pcm = (waveform * np.iinfo(np.int16).max).astype(np.int16)
+
+    buf = io.BytesIO()
+    wav.write(buf, SAMPLE_RATE, pcm)
+    buf.seek(0)
+
+    response = requests.post(
+        f"http://{IP_ADDRESS}:{PORT}/waveform",
+        files={"file": ("clip.wav", buf, "audio/wav")},
+        timeout=30,
+    )
+    return response.json()
 
 
 # ---------------------------------------------------------------------------
@@ -180,7 +176,7 @@ def listen() -> None:
                         if len(recording) >= MIN_SOUND_CHUNKS:
                             waveform = np.concatenate(recording)
                             threading.Thread(
-                                target=_classify_and_ring,
+                                target=_post_waveform,
                                 args=(waveform,),
                                 daemon=True,
                             ).start()
