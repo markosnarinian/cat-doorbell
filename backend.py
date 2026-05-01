@@ -113,11 +113,3 @@ async def classify(file: UploadFile = File(...)) -> JSONResponse:
             "cat_detected": cat_detected,
         }
     )
-
-
-if __name__ == "__main__":
-    sample_rate, wav_data = wavfile.read("miaow_16k.wav", "rb")
-    sample_rate, wav_data = ensure_sample_rate(sample_rate, wav_data)
-    waveform = wav_data / tf.int16.max
-
-    print(is_cat_present(waveform))

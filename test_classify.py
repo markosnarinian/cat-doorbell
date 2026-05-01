@@ -5,13 +5,15 @@ Usage:
     python test_classify.py
 """
 
-import json
 import sys
 from pathlib import Path
 
 import requests
+from dotenv import dotenv_values
 
-ENDPOINT = "http://localhost:8000/waveform"
+config = dotenv_values()
+
+ENDPOINT = f"http://{config['IP_ADDRESS']}:9000/waveform"
 WAV_FILE = Path(__file__).parent / "miaow_16k.wav"
 
 
